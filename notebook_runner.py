@@ -5,32 +5,78 @@ from typing import Callable, Optional
 import re
 import io
 import contextlib
+import os
 
-def _patch_notebook_source(nb_text: str, base_dir: Path,
-                           max_videos: Optional[int],
-                           max_images_total: Optional[int],
-                           skip_existing: bool) -> str:
+
+def _replace_assignment(source: str, var_name: str, value_expr: str) -> tuple[str, bool]:
     """
-    노트북을 최대한 '그대로' 재사용하기 위해,
-    실행 전에 몇 개의 상수(BASE, MAX_VIDEOS, MAX_IMAGES_TOTAL, SKIP_EXISTING)를 지정한 값으로 치환합니다.
+    코드 셀의 `VAR = ...` 대입문을 찾아 `VAR = value_expr` 형태로 교체합니다.
+    """
+    pattern = re.compile(rf"^(\s*){re.escape(var_name)}\s*=.*$", flags=re.M)
+    replaced = bool(pattern.search(source))
+    if not replaced:
+        return source, False
+    return pattern.sub(rf"\1{var_name} = {value_expr}", source), True
+
+
+def _patch_notebook_cells(
+    nb,
+    base_dir: Path,
+    max_videos: Optional[int],
+    max_images_total: Optional[int],
+    skip_existing: bool,
+):
+    """
+    실행 전에 노트북 코드셀 내부 상수(BASE, MAX_VIDEOS, MAX_IMAGES_TOTAL, SKIP_EXISTING)를 교체합니다.
     """
     base_dir = Path(base_dir).resolve()
+    base_expr = f'Path(r"{base_dir.as_posix()}").resolve()'
+    max_videos_expr = "None" if max_videos is None else str(int(max_videos))
+    max_images_total_expr = "None" if max_images_total is None else str(int(max_images_total))
+    skip_existing_expr = str(bool(skip_existing))
 
-    # BASE = Path("/content") 같은 라인을 교체
-    nb_text = re.sub(
-        r'BASE\s*=\s*Path\(["\'].*?["\']\)',
-        f'BASE = Path(r"{base_dir.as_posix()}")',
-        nb_text
-    )
+    for cell in nb.cells:
+        if cell.get("cell_type") != "code":
+            continue
 
-    def _replace_int_or_none(txt: str, var: str, val: Optional[int]) -> str:
-        repl = "None" if val is None else str(int(val))
-        return re.sub(rf'^{var}\s*=\s*.*$', f"{var} = {repl}", txt, flags=re.M)
+        src = cell.get("source", "")
+        src, _ = _replace_assignment(src, "BASE", base_expr)
+        src, _ = _replace_assignment(src, "MAX_VIDEOS", max_videos_expr)
+        src, _ = _replace_assignment(src, "MAX_IMAGES_TOTAL", max_images_total_expr)
+        src, _ = _replace_assignment(src, "SKIP_EXISTING", skip_existing_expr)
+        cell["source"] = src
 
-    nb_text = _replace_int_or_none(nb_text, "MAX_VIDEOS", max_videos)
-    nb_text = _replace_int_or_none(nb_text, "MAX_IMAGES_TOTAL", max_images_total)
-    nb_text = re.sub(r'^SKIP_EXISTING\s*=\s*.*$', f"SKIP_EXISTING = {str(bool(skip_existing))}", nb_text, flags=re.M)
-    return nb_text
+    return nb
+
+
+@contextlib.contextmanager
+def _temporary_env(updates: dict[str, str]):
+    """
+    노트북 실행 중에만 환경변수를 일시 적용합니다.
+    """
+    old_values = {k: os.environ.get(k) for k in updates}
+    try:
+        os.environ.update(updates)
+        yield
+    finally:
+        for k, old in old_values.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+
+
+def _format_reports_error(base_dir: Path) -> str:
+    base_dir = Path(base_dir).resolve()
+    expected = base_dir / "reports"
+    candidates = [p for p in base_dir.rglob("reports") if p.is_dir()]
+    if candidates:
+        found = ", ".join(str(p) for p in sorted(candidates))
+        return (
+            "reports 디렉토리가 예상 경로에 생성되지 않았습니다. "
+            f"예상 경로: {expected}. 발견된 후보: {found}"
+        )
+    return f"reports 디렉토리가 생성되지 않았습니다. 예상 경로: {expected}"
 
 def run_reliability_notebook(
     notebook_path: Path,
@@ -49,27 +95,26 @@ def run_reliability_notebook(
     if not notebook_path.exists():
         raise FileNotFoundError(f"Notebook not found: {notebook_path}")
 
-    nb_text = notebook_path.read_text(encoding="utf-8", errors="replace")
-    nb_text = _patch_notebook_source(
-        nb_text=nb_text,
-        base_dir=base_dir,
-        max_videos=max_videos,
-        max_images_total=max_images_total,
-        skip_existing=skip_existing,
-    )
-
     try:
         import nbformat
         from nbclient import NotebookClient
     except Exception as e:
         raise RuntimeError("nbformat/nbclient 가 필요합니다. 설치: pip install nbformat nbclient") from e
 
-    nb = nbformat.reads(nb_text, as_version=4)
+    nb = nbformat.read(notebook_path, as_version=4)
+    nb = _patch_notebook_cells(
+        nb=nb,
+        base_dir=base_dir,
+        max_videos=max_videos,
+        max_images_total=max_images_total,
+        skip_existing=skip_existing,
+    )
     client = NotebookClient(nb, timeout=None, kernel_name="python3")
 
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-        client.execute()
+    with _temporary_env({"BASE_DIR": str(Path(base_dir).resolve())}):
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            client.execute()
 
     if on_log:
         for line in buf.getvalue().splitlines():
@@ -77,7 +122,7 @@ def run_reliability_notebook(
 
     reports_dir = Path(base_dir) / "reports"
     if not reports_dir.exists():
-        raise RuntimeError(f"reports 디렉토리가 생성되지 않았습니다. 예상 경로: {reports_dir}")
+        raise RuntimeError(_format_reports_error(base_dir))
     return reports_dir
 
 def zip_dir(src_dir: Path, out_zip: Path) -> Path:

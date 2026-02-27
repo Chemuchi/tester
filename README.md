@@ -1,6 +1,6 @@
 ```bash
-python venv .venv
+python -m venv .venv
 source .venv/bin/activate
-pip install streamlit nbformat nbclient
+pip install -r requirements.txt
 streamlit run webui_streamlit_app.py
 ```
